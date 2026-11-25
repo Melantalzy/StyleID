@@ -1,0 +1,10 @@
+__pycache__
+.venv/
+.cache/
+.repo/
+results/
+output/
+precomputed_feats/
+downloads/
+*.zip
+*.pyc
