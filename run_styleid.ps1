@@ -23,9 +23,50 @@ param(
     [string]$Precision = "float16",
 
     [int[]]$Layers = @(7, 8, 9, 10, 11),
+    [ValidateSet("baseline", "dynamic", "token_dynamic", "output_fusion", "transport")]
+    [string]$TrajectoryMode = "baseline",
+    [ValidateRange(0.0001, 2.0)]
+    [double]$TrajectoryDriftThreshold = 0.4,
+    [ValidateRange(0.0, 1.0)]
+    [double]$TrajectoryMinGenerationWeight = 0.1,
+    [ValidateRange(0.0, 1.0)]
+    [double]$TrajectoryMaxGenerationWeight = 0.4,
+    [ValidateRange(0.0, 20.0)]
+    [double]$TrajectoryGuardStrength = 0.0,
+    [ValidateRange(0.0, 1.0)]
+    [double]$TrajectoryMinStyleGate = 1.0,
+    [ValidateRange(0.0, 1.0)]
+    [double]$TrajectoryStartFraction = 0.2,
+    [ValidateRange(0.0, 1.0)]
+    [double]$TrajectoryEndFraction = 0.8,
+    [ValidateRange(0.01, 20.0)]
+    [double]$TrajectoryTokenTemperature = 1.0,
+    [ValidateRange(0.0, 0.9999)]
+    [double]$TrajectoryTemporalSmoothing = 0.0,
+    [ValidateRange(0.0, 10.0)]
+    [double]$TrajectoryOutputStrength = 1.0,
+    [ValidateRange(1, 64)]
+    [int]$TransportPrototypeSide = 8,
+    [ValidateRange(0.001, 10.0)]
+    [double]$TransportTemperature = 0.07,
+    [ValidateRange(0.0, 1.0)]
+    [double]$TransportTemporalWeight = 0.25,
+    [ValidateRange(0.0, 10.0)]
+    [double]$TransportVelocity = 0.5,
+    [ValidateRange(0.0, 1.0)]
+    [double]$TransportCoverageStrength = 0.3,
+    [ValidateRange(0, 20)]
+    [int]$TransportSinkhornIterations = 3,
+    [ValidateRange(1, 65536)]
+    [int]$TransportMaxTokens = 1024,
+    [ValidateRange(1, 65536)]
+    [int]$TransportMinTokens = 1,
+    [ValidateRange(0.0, 10.0)]
+    [double]$TransportConfidencePower = 0.0,
     [switch]$WithoutInitAdaIN,
     [switch]$WithoutAttentionInjection,
     [switch]$SaveIntermediates,
+    [switch]$SaveTrajectoryDiagnostics,
     [switch]$Interactive,
     [switch]$VerifyWeights,
     [string]$ModelPath = ""
@@ -110,7 +151,7 @@ $styleStem = [System.IO.Path]::GetFileNameWithoutExtension($Style)
 $gammaTag = $Gamma.ToString("0.####", [System.Globalization.CultureInfo]::InvariantCulture).Replace('.', 'p')
 $temperatureTag = $Temperature.ToString("0.####", [System.Globalization.CultureInfo]::InvariantCulture).Replace('.', 'p')
 $runStamp = Get-Date -Format "yyyyMMdd_HHmmss_fff"
-$outputName = "c${contentStem}_s${styleStem}_d${Steps}_r${Resolution}_g${gammaTag}_t${temperatureTag}_${runStamp}.jpg"
+$outputName = "c${contentStem}_s${styleStem}_${TrajectoryMode}_d${Steps}_r${Resolution}_g${gammaTag}_t${temperatureTag}_${runStamp}.jpg"
 
 if ($Resolution % 8 -ne 0) {
     throw "Resolution must be divisible by 8. Received: $Resolution"
@@ -161,6 +202,7 @@ Write-Host "  T:          $Temperature"
 Write-Host "  Device:     $Device"
 Write-Host "  Precision:  $Precision"
 Write-Host "  Layers:     $($Layers -join ',')"
+Write-Host "  Trajectory: $TrajectoryMode"
 Write-Host ""
 
 if ($Interactive) {
@@ -185,6 +227,26 @@ $pythonArguments = @(
     "--T", $Temperature,
     "--save_dir", $SaveDir,
     "--output_name", $outputName,
+    "--trajectory_mode", $TrajectoryMode,
+    "--trajectory_drift_threshold", $TrajectoryDriftThreshold,
+    "--trajectory_min_generation_weight", $TrajectoryMinGenerationWeight,
+    "--trajectory_max_generation_weight", $TrajectoryMaxGenerationWeight,
+    "--trajectory_guard_strength", $TrajectoryGuardStrength,
+    "--trajectory_min_style_gate", $TrajectoryMinStyleGate,
+    "--trajectory_start_fraction", $TrajectoryStartFraction,
+    "--trajectory_end_fraction", $TrajectoryEndFraction,
+    "--trajectory_token_temperature", $TrajectoryTokenTemperature,
+    "--trajectory_temporal_smoothing", $TrajectoryTemporalSmoothing,
+    "--trajectory_output_strength", $TrajectoryOutputStrength,
+    "--transport_prototype_side", $TransportPrototypeSide,
+    "--transport_temperature", $TransportTemperature,
+    "--transport_temporal_weight", $TransportTemporalWeight,
+    "--transport_velocity", $TransportVelocity,
+    "--transport_coverage_strength", $TransportCoverageStrength,
+    "--transport_sinkhorn_iterations", $TransportSinkhornIterations,
+    "--transport_max_tokens", $TransportMaxTokens,
+    "--transport_min_tokens", $TransportMinTokens,
+    "--transport_confidence_power", $TransportConfidencePower,
     "--layers"
 )
 $pythonArguments += $Layers
@@ -197,6 +259,9 @@ if ($WithoutAttentionInjection) {
 }
 if ($SaveIntermediates) {
     $pythonArguments += "--save_intermediates"
+}
+if ($SaveTrajectoryDiagnostics) {
+    $pythonArguments += "--save_trajectory_diagnostics"
 }
 
 $env:HF_HOME = Join-Path $PSScriptRoot ".cache\huggingface"

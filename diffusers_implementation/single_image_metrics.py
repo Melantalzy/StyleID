@@ -338,6 +338,54 @@ def build_run_record(cfg, output_path, metrics):
         "layers": ",".join(str(layer) for layer in cfg.layers),
         "initial_adain": not cfg.without_init_adain,
         "attention_injection": not cfg.without_attn_injection,
+        "trajectory_mode": getattr(cfg, "trajectory_mode", "baseline"),
+        "trajectory_drift_threshold": getattr(
+            cfg, "trajectory_drift_threshold", 0.4
+        ),
+        "trajectory_min_generation_weight": getattr(
+            cfg, "trajectory_min_generation_weight", 0.1
+        ),
+        "trajectory_max_generation_weight": getattr(
+            cfg, "trajectory_max_generation_weight", 0.4
+        ),
+        "trajectory_guard_strength": getattr(
+            cfg, "trajectory_guard_strength", 0.0
+        ),
+        "trajectory_min_style_gate": getattr(
+            cfg, "trajectory_min_style_gate", 1.0
+        ),
+        "trajectory_start_fraction": getattr(
+            cfg, "trajectory_start_fraction", 0.2
+        ),
+        "trajectory_end_fraction": getattr(
+            cfg, "trajectory_end_fraction", 0.8
+        ),
+        "trajectory_token_temperature": getattr(
+            cfg, "trajectory_token_temperature", 1.0
+        ),
+        "trajectory_temporal_smoothing": getattr(
+            cfg, "trajectory_temporal_smoothing", 0.0
+        ),
+        "trajectory_output_strength": getattr(
+            cfg, "trajectory_output_strength", 1.0
+        ),
+        "transport_prototype_side": getattr(cfg, "transport_prototype_side", 8),
+        "transport_temperature": getattr(cfg, "transport_temperature", 0.07),
+        "transport_temporal_weight": getattr(
+            cfg, "transport_temporal_weight", 0.25
+        ),
+        "transport_velocity": getattr(cfg, "transport_velocity", 0.5),
+        "transport_coverage_strength": getattr(
+            cfg, "transport_coverage_strength", 0.3
+        ),
+        "transport_sinkhorn_iterations": getattr(
+            cfg, "transport_sinkhorn_iterations", 3
+        ),
+        "transport_max_tokens": getattr(cfg, "transport_max_tokens", 1024),
+        "transport_min_tokens": getattr(cfg, "transport_min_tokens", 1),
+        "transport_confidence_power": getattr(
+            cfg, "transport_confidence_power", 0.0
+        ),
         **metrics,
     }
 

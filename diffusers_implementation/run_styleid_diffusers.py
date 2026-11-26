@@ -1,6 +1,8 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 import os
+import json
 
 from utils import * # image save utils
 
@@ -41,7 +43,28 @@ class style_transfer_module():
         style_transfer_params_default = {
             'gamma': 0.75,
             'tau': 1.5,
-            'injection_layers': [7, 8, 9, 10, 11]
+            'injection_layers': [7, 8, 9, 10, 11],
+            'trajectory_mode': 'baseline',
+            'trajectory_drift_threshold': 0.4,
+            'trajectory_min_generation_weight': 0.1,
+            'trajectory_max_generation_weight': 0.4,
+            'trajectory_guard_strength': 0.0,
+            'trajectory_min_style_gate': 1.0,
+            'trajectory_start_fraction': 0.2,
+            'trajectory_end_fraction': 0.8,
+            'trajectory_token_temperature': 1.0,
+            'trajectory_temporal_smoothing': 0.0,
+            'trajectory_output_strength': 1.0,
+            'transport_prototype_side': 8,
+            'transport_temperature': 0.07,
+            'transport_temporal_weight': 0.25,
+            'transport_velocity': 0.5,
+            'transport_coverage_strength': 0.3,
+            'transport_sinkhorn_iterations': 3,
+            'transport_max_tokens': 1024,
+            'transport_min_tokens': 1,
+            'transport_confidence_power': 0.0,
+            'save_trajectory_diagnostics': False,
         }
         if style_transfer_params is not None:
             style_transfer_params_default.update(style_transfer_params)
@@ -60,6 +83,9 @@ class style_transfer_module():
         self.attn_features_modify = {} # where to save key value to modify (attention block feature)
 
         self.cur_t = None
+        self.trajectory_diagnostics = []
+        self.trajectory_weight_ema = {}
+        self.trajectory_transport_state = {}
         
         # Get residual and attention block in decoder
         # [0 ~ 11], total 12 layers
@@ -203,6 +229,163 @@ class style_transfer_module():
             pred_images.append(decode_latent(pred_latents[-1], **decode_kwargs))
                 
         return pred_images, pred_latents
+
+    @staticmethod
+    def _pool_style_prototypes(features, prototype_side):
+        batch_heads, token_count, head_dim = features.shape
+        spatial_side = int(round(token_count ** 0.5))
+        target_side = min(prototype_side, spatial_side)
+        if spatial_side * spatial_side == token_count:
+            spatial = features.transpose(1, 2).reshape(
+                batch_heads, head_dim, spatial_side, spatial_side
+            )
+            pooled = F.adaptive_avg_pool2d(
+                spatial, (target_side, target_side)
+            )
+            return pooled.flatten(2).transpose(1, 2)
+
+        pooled = F.adaptive_avg_pool1d(
+            features.transpose(1, 2), target_side * target_side
+        )
+        return pooled.transpose(1, 2)
+
+    @staticmethod
+    def _project_attention_heads(model, hidden_states, attention_heads):
+        residual = hidden_states
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+        else:
+            batch_size = hidden_states.shape[0]
+
+        projected = model.batch_to_head_dim(attention_heads)
+        projected = model.to_out[0](projected)
+        projected = model.to_out[1](projected)
+        if input_ndim == 4:
+            projected = projected.transpose(-1, -2).reshape(
+                batch_size, channel, height, width
+            )
+        if model.residual_connection:
+            projected = projected + residual
+        return projected / model.rescale_output_factor
+
+    def _transport_attention_output(self, name, model, hidden_states, q_c, q_g, k_s, v_s):
+        prototype_side = self.style_transfer_params['transport_prototype_side']
+        k_proto = self._pool_style_prototypes(k_s, prototype_side)
+        v_proto = self._pool_style_prototypes(v_s, prototype_side)
+
+        q_c_normalized = F.normalize(q_c.float(), dim=-1, eps=1e-8)
+        q_g_normalized = F.normalize(q_g.float(), dim=-1, eps=1e-8)
+        k_normalized = F.normalize(k_proto.float(), dim=-1, eps=1e-8)
+        inverse_temperature = 1.0 / self.style_transfer_params[
+            'transport_temperature'
+        ]
+        content_logits = torch.bmm(
+            q_c_normalized, k_normalized.transpose(1, 2)
+        ) * inverse_temperature
+        generation_logits = torch.bmm(
+            q_g_normalized, k_normalized.transpose(1, 2)
+        ) * inverse_temperature
+        content_map = torch.softmax(content_logits, dim=-1)
+        generation_map = torch.softmax(generation_logits, dim=-1)
+
+        mean_map = 0.5 * (content_map + generation_map)
+        correspondence_js = 0.5 * (
+            (
+                content_map
+                * (
+                    content_map.clamp_min(1e-8).log()
+                    - mean_map.clamp_min(1e-8).log()
+                )
+            ).sum(dim=-1)
+            + (
+                generation_map
+                * (
+                    generation_map.clamp_min(1e-8).log()
+                    - mean_map.clamp_min(1e-8).log()
+                )
+            ).sum(dim=-1)
+        )
+        correspondence_confidence = (
+            1.0 - correspondence_js / np.log(2.0)
+        ).clamp(0.0, 1.0)
+
+        eps = 1e-8
+        content_log = content_map.clamp_min(eps).log()
+        generation_log = generation_map.clamp_min(eps).log()
+        previous_state = self.trajectory_transport_state.get(name)
+        if previous_state is None:
+            prediction_log = content_log
+        else:
+            previous_map, previous_content_map = previous_state
+            previous_map = previous_map.float()
+            previous_content_map = previous_content_map.float()
+            prediction_log = previous_map.clamp_min(eps).log() + (
+                self.style_transfer_params['transport_velocity']
+                * (
+                    content_log
+                    - previous_content_map.clamp_min(eps).log()
+                )
+            )
+
+        temporal_weight = self.style_transfer_params[
+            'transport_temporal_weight'
+        ]
+        current_weight = (1.0 - temporal_weight) * 0.5
+        transport_logits = (
+            current_weight * content_log
+            + current_weight * generation_log
+            + temporal_weight * prediction_log
+        )
+        row_map = torch.softmax(transport_logits, dim=-1)
+
+        balanced_map = row_map
+        query_count = balanced_map.shape[-2]
+        prototype_count = balanced_map.shape[-1]
+        target_column_mass = query_count / max(prototype_count, 1)
+        for _ in range(
+            self.style_transfer_params['transport_sinkhorn_iterations']
+        ):
+            balanced_map = balanced_map / balanced_map.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(eps)
+            balanced_map = balanced_map / balanced_map.sum(
+                dim=-2, keepdim=True
+            ).clamp_min(eps)
+            balanced_map = balanced_map * target_column_mass
+        balanced_map = balanced_map / balanced_map.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(eps)
+
+        coverage_strength = self.style_transfer_params[
+            'transport_coverage_strength'
+        ]
+        transport_map = (
+            (1.0 - coverage_strength) * row_map
+            + coverage_strength * balanced_map
+        )
+        transport_map = transport_map / transport_map.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(eps)
+        self.trajectory_transport_state[name] = (
+            transport_map.detach().to(dtype=torch.float16),
+            content_map.detach().to(dtype=torch.float16),
+        )
+
+        transported_heads = torch.bmm(
+            transport_map, v_proto.float()
+        ).to(dtype=q_g.dtype)
+        transported_output = self._project_attention_heads(
+            model, hidden_states, transported_heads
+        )
+        normalized_entropy = (
+            -(
+                transport_map
+                * transport_map.clamp_min(eps).log()
+            ).sum(dim=-1).mean()
+            / np.log(max(prototype_count, 2))
+        )
+        return transported_output, normalized_entropy, correspondence_confidence
         
     # ============================ hook operations ===============================
     
@@ -234,14 +417,334 @@ class style_transfer_module():
                 )
                 
                 q_c, k_s, v_s = self.attn_features_modify[name][int(self.cur_t)]
-                
-                # style injection
-                q_hat_cs = q_c * self.style_transfer_params['gamma'] + q_cs * (1 - self.style_transfer_params['gamma'])
-                k_cs, v_cs = k_s, v_s
-                
-                # Replace query key and value
-                _, _, _, _, modified_output = attention_op(model, input[0], key=k_cs, value=v_cs, query=q_hat_cs, temperature=self.style_transfer_params['tau'])
-                
+
+                mode = self.style_transfer_params['trajectory_mode']
+                gamma = self.style_transfer_params['gamma']
+                generation_weight = q_cs.new_tensor(1.0 - gamma)
+                style_gate = q_cs.new_tensor(1.0)
+                drift = None
+                total_train_steps = self.scheduler.config.num_train_timesteps
+                denoise_progress = 1.0 - int(self.cur_t) / max(
+                    total_train_steps - 1, 1
+                )
+                dynamic_active = (
+                    mode in (
+                        'dynamic', 'token_dynamic', 'output_fusion', 'transport'
+                    )
+                    and self.style_transfer_params['trajectory_start_fraction']
+                    <= denoise_progress
+                    <= self.style_transfer_params['trajectory_end_fraction']
+                )
+
+                should_measure = (
+                    mode in (
+                        'dynamic', 'token_dynamic', 'output_fusion', 'transport'
+                    )
+                    or self.style_transfer_params['save_trajectory_diagnostics']
+                )
+                if should_measure:
+                    drift = (
+                        1.0
+                        - F.cosine_similarity(
+                            q_cs.float(), q_c.float(), dim=-1, eps=1e-8
+                        )
+                    ).mean().clamp(0.0, 2.0)
+
+                weight_min = generation_weight
+                weight_max = generation_weight
+                weight_std = generation_weight.new_zeros(())
+                fraction_below_baseline = generation_weight.new_zeros(())
+                fraction_above_baseline = generation_weight.new_zeros(())
+
+                if dynamic_active and mode == 'dynamic':
+                    threshold = self.style_transfer_params[
+                        'trajectory_drift_threshold'
+                    ]
+                    max_generation_weight = self.style_transfer_params[
+                        'trajectory_max_generation_weight'
+                    ]
+                    min_generation_weight = self.style_transfer_params[
+                        'trajectory_min_generation_weight'
+                    ]
+                    content_confidence = 1.0 - (drift / threshold).clamp(
+                        0.0, 1.0
+                    )
+                    generation_weight = (
+                        min_generation_weight
+                        + (max_generation_weight - min_generation_weight)
+                        * content_confidence
+                    )
+                    style_gate = torch.exp(
+                        -self.style_transfer_params['trajectory_guard_strength']
+                        * drift
+                    ).clamp(
+                        min=self.style_transfer_params['trajectory_min_style_gate'],
+                        max=1.0,
+                    )
+                    weight_min = generation_weight
+                    weight_max = generation_weight
+                    fraction_below_baseline = (
+                        generation_weight < (1.0 - gamma)
+                    ).float()
+                    fraction_above_baseline = (
+                        generation_weight > (1.0 - gamma)
+                    ).float()
+
+                if dynamic_active and mode in ('token_dynamic', 'output_fusion'):
+                    token_drift = 1.0 - F.cosine_similarity(
+                        q_cs.float(), q_c.float(), dim=-1, eps=1e-8
+                    )
+                    token_drift = token_drift.clamp(0.0, 2.0)
+                    quartiles = torch.quantile(
+                        token_drift,
+                        token_drift.new_tensor([0.25, 0.5, 0.75]),
+                        dim=-1,
+                        keepdim=True,
+                    )
+                    q25, q50, q75 = quartiles.unbind(dim=0)
+                    robust_scale = (q75 - q25).clamp_min(0.02)
+                    min_generation_weight = self.style_transfer_params[
+                        'trajectory_min_generation_weight'
+                    ]
+                    max_generation_weight = self.style_transfer_params[
+                        'trajectory_max_generation_weight'
+                    ]
+                    weight_range = max_generation_weight - min_generation_weight
+                    if weight_range > 0:
+                        baseline_ratio = (
+                            (1.0 - gamma) - min_generation_weight
+                        ) / weight_range
+                        baseline_ratio = min(max(baseline_ratio, 1e-4), 1.0 - 1e-4)
+                        baseline_logit = np.log(
+                            baseline_ratio / (1.0 - baseline_ratio)
+                        )
+                        normalized_drift = (q50 - token_drift) / (
+                            robust_scale
+                            * self.style_transfer_params[
+                                'trajectory_token_temperature'
+                            ]
+                        )
+                        token_confidence = torch.sigmoid(
+                            normalized_drift + baseline_logit
+                        )
+                        generation_weight = (
+                            min_generation_weight
+                            + weight_range * token_confidence
+                        )
+
+                        smoothing = self.style_transfer_params[
+                            'trajectory_temporal_smoothing'
+                        ]
+                        previous_weight = self.trajectory_weight_ema.get(name)
+                        if (
+                            smoothing > 0.0
+                            and previous_weight is not None
+                            and previous_weight.shape == generation_weight.shape
+                        ):
+                            generation_weight = (
+                                smoothing * previous_weight
+                                + (1.0 - smoothing) * generation_weight
+                            )
+                        self.trajectory_weight_ema[name] = generation_weight.detach()
+
+                    base_weight = 1.0 - gamma
+                    weight_min = generation_weight.min()
+                    weight_max = generation_weight.max()
+                    weight_std = generation_weight.float().std(unbiased=False)
+                    fraction_below_baseline = (
+                        generation_weight < base_weight
+                    ).float().mean()
+                    fraction_above_baseline = (
+                        generation_weight > base_weight
+                    ).float().mean()
+
+                if generation_weight.ndim > 0:
+                    token_weight = generation_weight[..., None].to(
+                        device=q_c.device, dtype=q_c.dtype
+                    )
+                    q_hat_cs = q_c * (1.0 - token_weight) + q_cs * token_weight
+                else:
+                    q_hat_cs = (
+                        q_c * (1.0 - generation_weight)
+                        + q_cs * generation_weight
+                    )
+
+                _, _, _, _, baseline_output = attention_op(
+                    model,
+                    input[0],
+                    key=k_s,
+                    value=v_s,
+                    query=q_hat_cs,
+                    temperature=self.style_transfer_params['tau'],
+                )
+
+                modified_output = baseline_output
+                output_change_ratio = baseline_output.new_zeros(())
+                transport_entropy = baseline_output.new_zeros(())
+                transport_confidence = baseline_output.new_zeros(())
+                if dynamic_active and mode == 'output_fusion':
+                    _, _, _, _, content_output = attention_op(
+                        model,
+                        input[0],
+                        key=k_s,
+                        value=v_s,
+                        query=q_c,
+                        temperature=self.style_transfer_params['tau'],
+                    )
+                    _, _, _, _, generation_output = attention_op(
+                        model,
+                        input[0],
+                        key=k_s,
+                        value=v_s,
+                        query=q_cs,
+                        temperature=self.style_transfer_params['tau'],
+                    )
+
+                    if generation_weight.ndim > 0:
+                        batch_size = q_cs.shape[0] // model.heads
+                        output_weight = generation_weight.view(
+                            batch_size, model.heads, generation_weight.shape[-1]
+                        ).mean(dim=1)
+                        output_weight = output_weight.to(
+                            device=content_output.device,
+                            dtype=content_output.dtype,
+                        )
+                        if content_output.ndim == 3:
+                            output_weight = output_weight[..., None]
+                        else:
+                            height, width = content_output.shape[-2:]
+                            output_weight = output_weight.view(
+                                batch_size, 1, height, width
+                            )
+                    else:
+                        output_weight = generation_weight.to(
+                            device=content_output.device,
+                            dtype=content_output.dtype,
+                        )
+
+                    fused_output = (
+                        content_output * (1.0 - output_weight)
+                        + generation_output * output_weight
+                    )
+                    output_strength = self.style_transfer_params[
+                        'trajectory_output_strength'
+                    ]
+                    modified_output = baseline_output + output_strength * (
+                        fused_output - baseline_output
+                    )
+                    output_change_ratio = (
+                        (modified_output.float() - baseline_output.float()).norm()
+                        / baseline_output.float().norm().clamp_min(1e-8)
+                    )
+
+                transport_active = (
+                    dynamic_active
+                    and mode == 'transport'
+                    and self.style_transfer_params['transport_min_tokens']
+                    <= q_cs.shape[1]
+                    <= self.style_transfer_params['transport_max_tokens']
+                )
+                if transport_active:
+                    (
+                        transported_output,
+                        transport_entropy,
+                        correspondence_confidence,
+                    ) = (
+                        self._transport_attention_output(
+                            name,
+                            model,
+                            input[0],
+                            q_c,
+                            q_cs,
+                            k_s,
+                            v_s,
+                        )
+                    )
+                    output_strength = self.style_transfer_params[
+                        'trajectory_output_strength'
+                    ]
+                    confidence_power = self.style_transfer_params[
+                        'transport_confidence_power'
+                    ]
+                    batch_size = q_cs.shape[0] // model.heads
+                    confidence_gate = correspondence_confidence.view(
+                        batch_size,
+                        model.heads,
+                        correspondence_confidence.shape[-1],
+                    ).mean(dim=1)
+                    confidence_gate = confidence_gate.pow(confidence_power).to(
+                        device=baseline_output.device,
+                        dtype=baseline_output.dtype,
+                    )
+                    if baseline_output.ndim == 3:
+                        confidence_gate = confidence_gate[..., None]
+                    else:
+                        height, width = baseline_output.shape[-2:]
+                        confidence_gate = confidence_gate.view(
+                            batch_size, 1, height, width
+                        )
+                    modified_output = baseline_output + (
+                        output_strength
+                        * confidence_gate
+                        * (transported_output - baseline_output)
+                    )
+                    transport_confidence = correspondence_confidence.mean()
+                    output_change_ratio = (
+                        (modified_output.float() - baseline_output.float()).norm()
+                        / baseline_output.float().norm().clamp_min(1e-8)
+                    )
+
+                if dynamic_active:
+                    output_gate = style_gate.to(
+                        device=modified_output.device,
+                        dtype=modified_output.dtype,
+                    )
+                    modified_output = (
+                        output_gate * modified_output
+                        + (1.0 - output_gate) * output
+                    )
+
+                if should_measure:
+                    self.trajectory_diagnostics.append(
+                        {
+                            'layer': name,
+                            'timestep': int(self.cur_t),
+                            'denoise_progress': float(denoise_progress),
+                            'dynamic_active': bool(dynamic_active),
+                            'transport_active': bool(transport_active),
+                            'token_count': int(q_cs.shape[1]),
+                            'query_drift': float(drift.detach().cpu().item()),
+                            'generation_weight': float(
+                                generation_weight.float().mean().detach().cpu().item()
+                            ),
+                            'generation_weight_min': float(
+                                weight_min.detach().cpu().item()
+                            ),
+                            'generation_weight_max': float(
+                                weight_max.detach().cpu().item()
+                            ),
+                            'generation_weight_std': float(
+                                weight_std.detach().cpu().item()
+                            ),
+                            'fraction_below_baseline': float(
+                                fraction_below_baseline.detach().cpu().item()
+                            ),
+                            'fraction_above_baseline': float(
+                                fraction_above_baseline.detach().cpu().item()
+                            ),
+                            'style_gate': float(style_gate.detach().cpu().item()),
+                            'output_change_ratio': float(
+                                output_change_ratio.detach().cpu().item()
+                            ),
+                            'transport_entropy': float(
+                                transport_entropy.detach().cpu().item()
+                            ),
+                            'transport_confidence': float(
+                                transport_confidence.detach().cpu().item()
+                            ),
+                        }
+                    )
+
                 return modified_output
         
         return hook
@@ -250,6 +753,75 @@ class style_transfer_module():
         features = self.attn_features
         self.attn_features = {name: {} for name in features}
         return features
+
+    def reset_trajectory_diagnostics(self):
+        self.trajectory_diagnostics = []
+        self.trajectory_weight_ema = {}
+        self.trajectory_transport_state = {}
+
+    def take_trajectory_diagnostics(self):
+        diagnostics = self.trajectory_diagnostics
+        self.trajectory_diagnostics = []
+        return diagnostics
+
+
+def summarize_trajectory_diagnostics(entries, cfg):
+    summary = {
+        'trajectory_mode': cfg.trajectory_mode,
+        'parameters': {
+            'gamma': cfg.gamma,
+            'drift_threshold': cfg.trajectory_drift_threshold,
+            'min_generation_weight': cfg.trajectory_min_generation_weight,
+            'max_generation_weight': cfg.trajectory_max_generation_weight,
+            'guard_strength': cfg.trajectory_guard_strength,
+            'min_style_gate': cfg.trajectory_min_style_gate,
+            'start_fraction': cfg.trajectory_start_fraction,
+            'end_fraction': cfg.trajectory_end_fraction,
+            'token_temperature': cfg.trajectory_token_temperature,
+            'temporal_smoothing': cfg.trajectory_temporal_smoothing,
+            'output_strength': cfg.trajectory_output_strength,
+            'transport_prototype_side': cfg.transport_prototype_side,
+            'transport_temperature': cfg.transport_temperature,
+            'transport_temporal_weight': cfg.transport_temporal_weight,
+            'transport_velocity': cfg.transport_velocity,
+            'transport_coverage_strength': cfg.transport_coverage_strength,
+            'transport_sinkhorn_iterations': cfg.transport_sinkhorn_iterations,
+            'transport_max_tokens': cfg.transport_max_tokens,
+            'transport_min_tokens': cfg.transport_min_tokens,
+            'transport_confidence_power': cfg.transport_confidence_power,
+        },
+        'entry_count': len(entries),
+        'entries': entries,
+    }
+    if entries:
+        for key in (
+            'query_drift',
+            'generation_weight',
+            'generation_weight_min',
+            'generation_weight_max',
+            'generation_weight_std',
+            'fraction_below_baseline',
+            'fraction_above_baseline',
+            'style_gate',
+            'output_change_ratio',
+            'transport_entropy',
+            'transport_confidence',
+        ):
+            values = np.asarray([entry[key] for entry in entries], dtype=np.float64)
+            summary[key] = {
+                'mean': float(values.mean()),
+                'minimum': float(values.min()),
+                'maximum': float(values.max()),
+            }
+    return summary
+
+
+def write_trajectory_diagnostics(entries, cfg, output_path):
+    diagnostics_path = os.path.splitext(output_path)[0] + '.trajectory.json'
+    summary = summarize_trajectory_diagnostics(entries, cfg)
+    with open(diagnostics_path, 'w', encoding='utf-8') as diagnostics_file:
+        json.dump(summary, diagnostics_file, ensure_ascii=False, indent=2)
+    return diagnostics_path
     
     
 if __name__ == "__main__":
@@ -262,6 +834,64 @@ if __name__ == "__main__":
         raise ValueError("--gamma must be between 0 and 1")
     if cfg.T <= 0:
         raise ValueError("--T must be greater than 0")
+    if cfg.trajectory_drift_threshold <= 0:
+        raise ValueError("--trajectory_drift_threshold must be greater than 0")
+    base_generation_weight = 1.0 - cfg.gamma
+    if (
+        cfg.trajectory_mode in (
+            'dynamic', 'token_dynamic', 'output_fusion', 'transport'
+        )
+        and not 0.0
+        <= cfg.trajectory_min_generation_weight
+        <= base_generation_weight
+        <= cfg.trajectory_max_generation_weight
+        <= 1.0
+    ):
+        raise ValueError(
+            "trajectory generation weights must satisfy 0 <= min <= "
+            f"{base_generation_weight:.4f} <= max <= 1"
+        )
+    if cfg.trajectory_guard_strength < 0:
+        raise ValueError("--trajectory_guard_strength must be non-negative")
+    if not 0.0 <= cfg.trajectory_min_style_gate <= 1.0:
+        raise ValueError("--trajectory_min_style_gate must be between 0 and 1")
+    if not (
+        0.0
+        <= cfg.trajectory_start_fraction
+        <= cfg.trajectory_end_fraction
+        <= 1.0
+    ):
+        raise ValueError(
+            "trajectory fractions must satisfy 0 <= start <= end <= 1"
+        )
+    if cfg.trajectory_token_temperature <= 0:
+        raise ValueError("--trajectory_token_temperature must be greater than 0")
+    if not 0.0 <= cfg.trajectory_temporal_smoothing < 1.0:
+        raise ValueError(
+            "--trajectory_temporal_smoothing must satisfy 0 <= value < 1"
+        )
+    if cfg.trajectory_output_strength < 0.0:
+        raise ValueError("--trajectory_output_strength must be non-negative")
+    if cfg.transport_prototype_side <= 0:
+        raise ValueError("--transport_prototype_side must be greater than 0")
+    if cfg.transport_temperature <= 0.0:
+        raise ValueError("--transport_temperature must be greater than 0")
+    if not 0.0 <= cfg.transport_temporal_weight <= 1.0:
+        raise ValueError("--transport_temporal_weight must be between 0 and 1")
+    if cfg.transport_velocity < 0.0:
+        raise ValueError("--transport_velocity must be non-negative")
+    if not 0.0 <= cfg.transport_coverage_strength <= 1.0:
+        raise ValueError("--transport_coverage_strength must be between 0 and 1")
+    if cfg.transport_sinkhorn_iterations < 0:
+        raise ValueError("--transport_sinkhorn_iterations must be non-negative")
+    if cfg.transport_max_tokens <= 0:
+        raise ValueError("--transport_max_tokens must be greater than 0")
+    if not 0 < cfg.transport_min_tokens <= cfg.transport_max_tokens:
+        raise ValueError(
+            "transport token limits must satisfy 0 < min_tokens <= max_tokens"
+        )
+    if cfg.transport_confidence_power < 0.0:
+        raise ValueError("--transport_confidence_power must be non-negative")
 
     # Result save at save_dir
     save_dir = cfg.save_dir
@@ -296,6 +926,27 @@ if __name__ == "__main__":
         'gamma': cfg.gamma,
         'tau': cfg.T,
         'injection_layers': cfg.layers,
+        'trajectory_mode': cfg.trajectory_mode,
+        'trajectory_drift_threshold': cfg.trajectory_drift_threshold,
+        'trajectory_min_generation_weight': cfg.trajectory_min_generation_weight,
+        'trajectory_max_generation_weight': cfg.trajectory_max_generation_weight,
+        'trajectory_guard_strength': cfg.trajectory_guard_strength,
+        'trajectory_min_style_gate': cfg.trajectory_min_style_gate,
+        'trajectory_start_fraction': cfg.trajectory_start_fraction,
+        'trajectory_end_fraction': cfg.trajectory_end_fraction,
+        'trajectory_token_temperature': cfg.trajectory_token_temperature,
+        'trajectory_temporal_smoothing': cfg.trajectory_temporal_smoothing,
+        'trajectory_output_strength': cfg.trajectory_output_strength,
+        'transport_prototype_side': cfg.transport_prototype_side,
+        'transport_temperature': cfg.transport_temperature,
+        'transport_temporal_weight': cfg.transport_temporal_weight,
+        'transport_velocity': cfg.transport_velocity,
+        'transport_coverage_strength': cfg.transport_coverage_strength,
+        'transport_sinkhorn_iterations': cfg.transport_sinkhorn_iterations,
+        'transport_max_tokens': cfg.transport_max_tokens,
+        'transport_min_tokens': cfg.transport_min_tokens,
+        'transport_confidence_power': cfg.transport_confidence_power,
+        'save_trajectory_diagnostics': cfg.save_trajectory_diagnostics,
     }
     
     # Get SD modules
@@ -386,7 +1037,9 @@ if __name__ == "__main__":
 
     # reverse process
     print("Style transfer...")
+    unet_wrapper.reset_trajectory_diagnostics()
     images, latents = unet_wrapper.reverse_process(latent_cs, denoise_kwargs=denoise_kwargs) # reverse process save activations such as attn, res
+    trajectory_diagnostics = unet_wrapper.take_trajectory_diagnostics()
     
     # save image
     images = [denormalize(image)[0] for image in images]
@@ -397,6 +1050,12 @@ if __name__ == "__main__":
         raise ValueError("--output_name must be a filename, not a path")
     output_path = os.path.join(save_dir, cfg.output_name)
     save_image(image_last, output_path)
+
+    if cfg.save_trajectory_diagnostics:
+        trajectory_path = write_trajectory_diagnostics(
+            trajectory_diagnostics, cfg, output_path
+        )
+        print(f"Saved trajectory diagnostics to {os.path.abspath(trajectory_path)}")
 
     print(f"Saved result to {os.path.abspath(output_path)}")
 

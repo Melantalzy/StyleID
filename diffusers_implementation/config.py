@@ -11,6 +11,41 @@ def get_args():
     parse.add_argument('--without_init_adain', action='store_true')
     parse.add_argument('--without_attn_injection', action='store_true')
     parse.add_argument('--layers', nargs='+', type=int, default=[7, 8, 9, 10, 11])
+    parse.add_argument(
+        '--trajectory_mode',
+        choices=[
+            'baseline', 'dynamic', 'token_dynamic', 'output_fusion', 'transport'
+        ],
+        default='baseline',
+        help=(
+            'baseline keeps the original fixed StyleID query blend; dynamic '
+            'uses generation-aware three-trajectory alignment.'
+        ),
+    )
+    parse.add_argument('--trajectory_drift_threshold', type=float, default=0.4)
+    parse.add_argument('--trajectory_min_generation_weight', type=float, default=0.1)
+    parse.add_argument('--trajectory_max_generation_weight', type=float, default=0.4)
+    parse.add_argument('--trajectory_guard_strength', type=float, default=0.0)
+    parse.add_argument('--trajectory_min_style_gate', type=float, default=1.0)
+    parse.add_argument('--trajectory_start_fraction', type=float, default=0.2)
+    parse.add_argument('--trajectory_end_fraction', type=float, default=0.8)
+    parse.add_argument('--trajectory_token_temperature', type=float, default=1.0)
+    parse.add_argument('--trajectory_temporal_smoothing', type=float, default=0.0)
+    parse.add_argument('--trajectory_output_strength', type=float, default=1.0)
+    parse.add_argument('--transport_prototype_side', type=int, default=8)
+    parse.add_argument('--transport_temperature', type=float, default=0.07)
+    parse.add_argument('--transport_temporal_weight', type=float, default=0.25)
+    parse.add_argument('--transport_velocity', type=float, default=0.5)
+    parse.add_argument('--transport_coverage_strength', type=float, default=0.3)
+    parse.add_argument('--transport_sinkhorn_iterations', type=int, default=3)
+    parse.add_argument('--transport_max_tokens', type=int, default=1024)
+    parse.add_argument('--transport_min_tokens', type=int, default=1)
+    parse.add_argument('--transport_confidence_power', type=float, default=0.0)
+    parse.add_argument(
+        '--save_trajectory_diagnostics',
+        action='store_true',
+        help='Save per-layer, per-timestep query drift and alignment weights.',
+    )
     
     # hyperparameters of diffusion model
     parse.add_argument('--ddim_steps', type=int, default=20)

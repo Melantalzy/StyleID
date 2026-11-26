@@ -9,7 +9,11 @@ import time
 import numpy as np
 import torch
 
-from run_styleid_diffusers import load_input_image, style_transfer_module
+from run_styleid_diffusers import (
+    load_input_image,
+    style_transfer_module,
+    write_trajectory_diagnostics,
+)
 from single_image_metrics import (
     _extract_vae_features,
     build_run_record,
@@ -50,6 +54,37 @@ def get_args():
     parser.add_argument("--without_init_adain", action="store_true")
     parser.add_argument("--without_attn_injection", action="store_true")
     parser.add_argument("--save_intermediates", action="store_true")
+    parser.add_argument(
+        "--trajectory_mode",
+        choices=[
+            "baseline", "dynamic", "token_dynamic", "output_fusion", "transport"
+        ],
+        default="baseline",
+    )
+    parser.add_argument("--trajectory_drift_threshold", type=float, default=0.4)
+    parser.add_argument(
+        "--trajectory_min_generation_weight", type=float, default=0.1
+    )
+    parser.add_argument(
+        "--trajectory_max_generation_weight", type=float, default=0.4
+    )
+    parser.add_argument("--trajectory_guard_strength", type=float, default=0.0)
+    parser.add_argument("--trajectory_min_style_gate", type=float, default=1.0)
+    parser.add_argument("--trajectory_start_fraction", type=float, default=0.2)
+    parser.add_argument("--trajectory_end_fraction", type=float, default=0.8)
+    parser.add_argument("--trajectory_token_temperature", type=float, default=1.0)
+    parser.add_argument("--trajectory_temporal_smoothing", type=float, default=0.0)
+    parser.add_argument("--trajectory_output_strength", type=float, default=1.0)
+    parser.add_argument("--transport_prototype_side", type=int, default=8)
+    parser.add_argument("--transport_temperature", type=float, default=0.07)
+    parser.add_argument("--transport_temporal_weight", type=float, default=0.25)
+    parser.add_argument("--transport_velocity", type=float, default=0.5)
+    parser.add_argument("--transport_coverage_strength", type=float, default=0.3)
+    parser.add_argument("--transport_sinkhorn_iterations", type=int, default=3)
+    parser.add_argument("--transport_max_tokens", type=int, default=1024)
+    parser.add_argument("--transport_min_tokens", type=int, default=1)
+    parser.add_argument("--transport_confidence_power", type=float, default=0.0)
+    parser.add_argument("--save_trajectory_diagnostics", action="store_true")
     parser.add_argument("--limit_contents", type=int, default=None)
     parser.add_argument("--limit_styles", type=int, default=None)
     return parser.parse_args()
@@ -131,6 +166,64 @@ def main():
         raise ValueError("--gamma must be between 0 and 1")
     if cfg.T <= 0:
         raise ValueError("--T must be greater than 0")
+    if cfg.trajectory_drift_threshold <= 0:
+        raise ValueError("--trajectory_drift_threshold must be greater than 0")
+    base_generation_weight = 1.0 - cfg.gamma
+    if (
+        cfg.trajectory_mode in (
+            "dynamic", "token_dynamic", "output_fusion", "transport"
+        )
+        and not 0.0
+        <= cfg.trajectory_min_generation_weight
+        <= base_generation_weight
+        <= cfg.trajectory_max_generation_weight
+        <= 1.0
+    ):
+        raise ValueError(
+            "trajectory generation weights must satisfy 0 <= min <= "
+            f"{base_generation_weight:.4f} <= max <= 1"
+        )
+    if cfg.trajectory_guard_strength < 0:
+        raise ValueError("--trajectory_guard_strength must be non-negative")
+    if not 0.0 <= cfg.trajectory_min_style_gate <= 1.0:
+        raise ValueError("--trajectory_min_style_gate must be between 0 and 1")
+    if not (
+        0.0
+        <= cfg.trajectory_start_fraction
+        <= cfg.trajectory_end_fraction
+        <= 1.0
+    ):
+        raise ValueError(
+            "trajectory fractions must satisfy 0 <= start <= end <= 1"
+        )
+    if cfg.trajectory_token_temperature <= 0:
+        raise ValueError("--trajectory_token_temperature must be greater than 0")
+    if not 0.0 <= cfg.trajectory_temporal_smoothing < 1.0:
+        raise ValueError(
+            "--trajectory_temporal_smoothing must satisfy 0 <= value < 1"
+        )
+    if cfg.trajectory_output_strength < 0.0:
+        raise ValueError("--trajectory_output_strength must be non-negative")
+    if cfg.transport_prototype_side <= 0:
+        raise ValueError("--transport_prototype_side must be greater than 0")
+    if cfg.transport_temperature <= 0.0:
+        raise ValueError("--transport_temperature must be greater than 0")
+    if not 0.0 <= cfg.transport_temporal_weight <= 1.0:
+        raise ValueError("--transport_temporal_weight must be between 0 and 1")
+    if cfg.transport_velocity < 0.0:
+        raise ValueError("--transport_velocity must be non-negative")
+    if not 0.0 <= cfg.transport_coverage_strength <= 1.0:
+        raise ValueError("--transport_coverage_strength must be between 0 and 1")
+    if cfg.transport_sinkhorn_iterations < 0:
+        raise ValueError("--transport_sinkhorn_iterations must be non-negative")
+    if cfg.transport_max_tokens <= 0:
+        raise ValueError("--transport_max_tokens must be greater than 0")
+    if not 0 < cfg.transport_min_tokens <= cfg.transport_max_tokens:
+        raise ValueError(
+            "transport token limits must satisfy 0 < min_tokens <= max_tokens"
+        )
+    if cfg.transport_confidence_power < 0.0:
+        raise ValueError("--transport_confidence_power must be non-negative")
 
     content_paths = image_paths(cfg.cnt_dir, cfg.limit_contents)
     style_paths = image_paths(cfg.sty_dir, cfg.limit_styles)
@@ -167,6 +260,27 @@ def main():
         "gamma": cfg.gamma,
         "tau": cfg.T,
         "injection_layers": cfg.layers,
+        "trajectory_mode": cfg.trajectory_mode,
+        "trajectory_drift_threshold": cfg.trajectory_drift_threshold,
+        "trajectory_min_generation_weight": cfg.trajectory_min_generation_weight,
+        "trajectory_max_generation_weight": cfg.trajectory_max_generation_weight,
+        "trajectory_guard_strength": cfg.trajectory_guard_strength,
+        "trajectory_min_style_gate": cfg.trajectory_min_style_gate,
+        "trajectory_start_fraction": cfg.trajectory_start_fraction,
+        "trajectory_end_fraction": cfg.trajectory_end_fraction,
+        "trajectory_token_temperature": cfg.trajectory_token_temperature,
+        "trajectory_temporal_smoothing": cfg.trajectory_temporal_smoothing,
+        "trajectory_output_strength": cfg.trajectory_output_strength,
+        "transport_prototype_side": cfg.transport_prototype_side,
+        "transport_temperature": cfg.transport_temperature,
+        "transport_temporal_weight": cfg.transport_temporal_weight,
+        "transport_velocity": cfg.transport_velocity,
+        "transport_coverage_strength": cfg.transport_coverage_strength,
+        "transport_sinkhorn_iterations": cfg.transport_sinkhorn_iterations,
+        "transport_max_tokens": cfg.transport_max_tokens,
+        "transport_min_tokens": cfg.transport_min_tokens,
+        "transport_confidence_power": cfg.transport_confidence_power,
+        "save_trajectory_diagnostics": cfg.save_trajectory_diagnostics,
     }
     wrapper = style_transfer_module(
         unet,
@@ -268,11 +382,17 @@ def main():
                     + style_latent.mean(dim=(2, 3), keepdim=True)
                 )
 
+            wrapper.reset_trajectory_diagnostics()
             images, generated_latents = wrapper.reverse_process(
                 combined_latent, denoise_kwargs=denoise_kwargs
             )
+            trajectory_diagnostics = wrapper.take_trajectory_diagnostics()
             stylized_image = denormalize(images[-1])[0]
             save_image(stylized_image, output_path)
+            if cfg.save_trajectory_diagnostics:
+                write_trajectory_diagnostics(
+                    trajectory_diagnostics, cfg, output_path
+                )
 
             metrics = evaluate_single_result(
                 content_image=content["image"],
